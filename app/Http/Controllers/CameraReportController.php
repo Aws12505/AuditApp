@@ -2,20 +2,18 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Store;
+use App\Models\CustomReport;
 use App\Models\Entity;
+use App\Models\Store;
 use App\Services\ScoringService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
-use Inertia\Inertia;
-use Symfony\Component\HttpFoundation\StreamedResponse;
 use Illuminate\Support\Facades\Auth;
-use ZipArchive;
-use Illuminate\Support\Str;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
-use PhpOffice\PhpSpreadsheet\Spreadsheet;
-use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use Illuminate\Support\Str;
+use Inertia\Inertia;
 use PhpOffice\PhpSpreadsheet\Cell\Coordinate;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
 use PhpOffice\PhpSpreadsheet\Style\Border;
 use PhpOffice\PhpSpreadsheet\Style\Fill;
@@ -146,10 +144,10 @@ class CameraReportController extends Controller
         // 6) Zip it
         $tmpZipPath = storage_path('app/tmp_' . Str::random(16) . '.zip');
 
-        $zip = new ZipArchive();
+        $zip = new ZipArchive;
         if ($zip->open($tmpZipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
             @unlink($tmpXlsxPath);
-            throw new \RuntimeException("Failed to create ZIP");
+            throw new \RuntimeException('Failed to create ZIP');
         }
 
         $zip->addFile($tmpXlsxPath, $xlsxName);
@@ -209,7 +207,7 @@ class CameraReportController extends Controller
                 $entityData = $storeSummary['entities'][$entityId];
                 $ratingCounts = $entityData['rating_counts'] ?? [];
 
-                if (!is_array($ratingCounts) || count($ratingCounts) === 0) {
+                if (! is_array($ratingCounts) || count($ratingCounts) === 0) {
                     continue;
                 }
 
@@ -236,7 +234,7 @@ class CameraReportController extends Controller
         $groups = [];
         foreach ($visibleEntities as $entity) {
             $label = $entity->category->label ?? 'Uncategorized';
-            if (!isset($groups[$label])) {
+            if (! isset($groups[$label])) {
                 $groups[$label] = [
                     'label' => $label,
                     'entities' => [],
@@ -261,7 +259,7 @@ class CameraReportController extends Controller
     ): void {
         $visibleEntities = collect($visibleEntities)->values();
 
-        $spreadsheet = new Spreadsheet();
+        $spreadsheet = new Spreadsheet;
         $sheet = $spreadsheet->getActiveSheet();
         $sheet->setTitle('Camera Report');
 
@@ -707,7 +705,7 @@ class CameraReportController extends Controller
              * 6) Scoring logic (unchanged)
              */
             $perDateScoresWithoutAuto = [];
-            $hasAnyWeeklyAutoFail = false;
+            $hasWeeklyZeroScore = false;
 
             if (isset($formsByStoreByDate[$sid])) {
                 foreach ($formsByStoreByDate[$sid] as $dateStr => $formsForDate) {
@@ -725,12 +723,12 @@ class CameraReportController extends Controller
                     $scoreWithoutAuto = ($denom > 0) ? $pass / $denom : null;
                     $perDateScoresWithoutAuto[] = $scoreWithoutAuto;
 
+                    // update here
                     foreach ($formsForDate as $form) {
-                        if (
-                            strtolower($form->rating_label ?? '') === 'auto fail'
-                            && $form->date_range_type === 'weekly'
-                        ) {
-                            $hasAnyWeeklyAutoFail = true;
+                        $label = strtolower($form->rating_label ?? '');
+
+                        if (in_array($label, ['auto fail', 'urgent'], true) && $form->date_range_type === 'weekly') {
+                            $hasWeeklyZeroScore = true;
                             break;
                         }
                     }
@@ -746,7 +744,7 @@ class CameraReportController extends Controller
             if (isset($formsByStoreByDate[$sid])) {
                 $weeklyScore = $this->scoringService->calculateWeeklyScore(
                     $formsByStoreByDate[$sid],
-                    $hasAnyWeeklyAutoFail
+                    $hasWeeklyZeroScore
                 );
                 $finalScoreWithAuto = $weeklyScore !== null ? round($weeklyScore, 2) : null;
             }
