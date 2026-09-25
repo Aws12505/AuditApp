@@ -37,7 +37,7 @@ class StoreCustomReportRequest extends FormRequest
             'entity_ids.*.exists' => 'Each selected entity must be a valid entity.',
         ];
     }
-    /*
+
     protected function failedValidation(Validator $validator)
     {
         throw new HttpResponseException(
@@ -48,5 +48,4 @@ class StoreCustomReportRequest extends FormRequest
             ], 422)
         );
     }
-    */
 }

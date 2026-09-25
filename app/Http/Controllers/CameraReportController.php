@@ -17,10 +17,8 @@ use PhpOffice\PhpSpreadsheet\Spreadsheet;
 use PhpOffice\PhpSpreadsheet\Style\Alignment;
 use PhpOffice\PhpSpreadsheet\Style\Border;
 use PhpOffice\PhpSpreadsheet\Style\Fill;
-use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
-use Symfony\Component\HttpFoundation\StreamedResponse;
-use ZipArchive;
-
+use App\Models\Category;
+use App\Models\CustomReport;
 class CameraReportController extends Controller
 {
     protected ScoringService $scoringService;
@@ -33,21 +31,23 @@ class CameraReportController extends Controller
     public function index(Request $request)
     {
         $user = Auth::user();
+        if (!$user)
+            abort(401);
 
-        // Stores & groups based on role
-        if ($user->isAdmin()) {
-            $stores = Store::select('id', 'store', 'group')->orderBy('store')->get();
-            $groups = Store::select('group')->distinct()->whereNotNull('group')->orderBy('group')->pluck('group');
-        } else {
-            $userGroups = $user->getGroupNumbers();
-            $stores = Store::select('id', 'store', 'group')
-                ->whereIn('group', $userGroups)
-                ->orderBy('store')
-                ->get();
-            $groups = collect($userGroups)->sort()->values();
-        }
+        $allowedStoreIds = $user->allowedStoreIdsCached();
 
-        // Ratings for dropdown filter
+        $stores = Store::select('id', 'store', 'group')
+            ->whereIn('id', $allowedStoreIds)
+            ->orderBy('store')
+            ->get();
+
+        $groups = Store::select('group')
+            ->distinct()
+            ->whereNotNull('group')
+            ->whereIn('id', $allowedStoreIds)
+            ->orderBy('group')
+            ->pluck('group');
+
         $ratings = DB::table('ratings')
             ->select('id', 'label')
             ->orderBy('id')
@@ -55,93 +55,28 @@ class CameraReportController extends Controller
 
         $reportData = $this->getReportData($request, $user);
 
+        $categories = Category::select('id', 'label')
+            ->orderBy('sort_order')
+            ->get();
+
         return Inertia::render('CameraReports/Index', [
             'reportData' => $reportData,
             'stores' => $stores,
             'groups' => $groups,
             'ratings' => $ratings,
-            'filters' => $request->only(['store_id', 'group', 'report_type', 'date_from', 'date_to', 'rating_id']),
-            'customReports' => CustomReport::all(),
-        ]);
-    }
-
-    public function exportExcel(Request $request): StreamedResponse
-    {
-        $user = Auth::user();
-
-        $reportData = $this->getReportData($request, $user);
-
-        $summary = $reportData['summary'];
-        $entities = collect($reportData['entities']);
-        $scoreData = $reportData['scoreData'];
-
-        $visibleEntities = $this->computeVisibleEntities($entities, $summary);
-        $categoryGroups = $this->computeCategoryGroups($visibleEntities);
-
-        $date = now()->format('Y-m-d');
-        $xlsxName = "camera_report_Excel_{$date}.xlsx";
-
-        $tmpXlsxPath = storage_path('app/tmp_' . Str::random(16) . '.xlsx');
-
-        $this->buildReportXlsxPreviousDesignWithNotes(
-            $tmpXlsxPath,
-            $summary,
-            $visibleEntities,
-            $categoryGroups,
-            $scoreData
-        );
-
-        return new StreamedResponse(function () use ($tmpXlsxPath) {
-            readfile($tmpXlsxPath);
-            @unlink($tmpXlsxPath);
-        }, 200, [
-            'Content-Type' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'Content-Disposition' => 'attachment; filename="' . $xlsxName . '"',
-        ]);
-    }
-
-    public function exportImages(Request $request): StreamedResponse
-    {
-        $user = Auth::user();
-
-        $attachments = $this->getReportAttachments($request, $user);
-
-        $date = now()->format('Y-m-d');
-        $zipName = "camera_report_Images_{$date}.zip";
-
-        $tmpZipPath = storage_path('app/tmp_' . Str::random(16) . '.zip');
-
-        $zip = new ZipArchive;
-        if ($zip->open($tmpZipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
-            throw new \RuntimeException('Failed to create ZIP');
-        }
-
-        foreach ($attachments as $att) {
-            if (! $att->path) {
-                continue;
-            }
-            if (! Storage::disk('public')->exists($att->path)) {
-                continue;
-            }
-
-            $storeSlug = Str::slug($att->store_name ?: 'store-' . $att->store_id);
-            $folder = "stores/{$att->store_id}-{$storeSlug}/{$att->date}";
-            $filename = basename($att->path);
-
-            $zip->addFromString(
-                "{$folder}/{$filename}",
-                Storage::disk('public')->get($att->path)
-            );
-        }
-
-        $zip->close();
-
-        return new StreamedResponse(function () use ($tmpZipPath) {
-            readfile($tmpZipPath);
-            @unlink($tmpZipPath);
-        }, 200, [
-            'Content-Type' => 'application/zip',
-            'Content-Disposition' => 'attachment; filename="' . $zipName . '"',
+            'categories' => $categories, // ADD
+            'custom_reports' => CustomReport::select('id', 'name')->orderBy('name')->get(),
+            'filters' => $request->only([
+                'store_id',
+                'group',
+                'report_type',
+                'date_from',
+                'custom_report_id', // ADD
+                'date_to',
+                'rating_id',
+                'category_ids', // ADD
+                'date_range_type', // ADD
+            ]),
         ]);
     }
 
@@ -172,26 +107,23 @@ class CameraReportController extends Controller
         $dateFrom = (string) $request->input('date_from', '');
         $dateTo = (string) $request->input('date_to', '');
         $ratingId = (string) $request->input('rating_id', '');
-
+        $categoryIds = $request->input('category_ids', []);
+        $dateRangeType = $request->input('date_range_type', '');
         $timestamp = now()->format('Y-m-d');
 
         $parts = [];
-        if ($reportType !== '') {
+        if ($reportType !== '')
             $parts[] = "Type-{$reportType}";
-        }
-        if ($storeId !== '') {
+        if ($storeId !== '')
             $parts[] = "Store-{$storeId}";
-        }
-        if ($group !== '') {
+        if ($group !== '')
             $parts[] = "Group-{$group}";
-        }
-        if ($ratingId !== '') {
+        if ($ratingId !== '')
             $parts[] = "Rating-{$ratingId}";
-        }
-        if ($dateFrom !== '' || $dateTo !== '') {
+        if ($dateFrom !== '' || $dateTo !== '')
             $parts[] = "{$dateFrom}_to_{$dateTo}";
-        }
-
+        if (!empty($categoryIds))
+            $parts[] = "Cat-" . implode('-', $categoryIds);
         $baseName = 'camera-report' . (count($parts) ? '-' . implode('_', $parts) : '') . "_{$timestamp}";
         $xlsxName = "{$baseName}.xlsx";
         $zipName = "{$baseName}.zip";
@@ -226,12 +158,10 @@ class CameraReportController extends Controller
             $zipDateFolder = "{$zipStoreFolder}/{$att->date}";
 
             $relativePathInDisk = $att->path;
-            if (! $relativePathInDisk) {
+            if (!$relativePathInDisk)
                 continue;
-            }
-            if (! Storage::disk('public')->exists($relativePathInDisk)) {
+            if (!Storage::disk('public')->exists($relativePathInDisk))
                 continue;
-            }
 
             $fileContents = Storage::disk('public')->get($relativePathInDisk);
             $filename = basename($relativePathInDisk);
@@ -271,9 +201,8 @@ class CameraReportController extends Controller
             $entityId = $entity->id;
 
             foreach ($summary as $storeSummary) {
-                if (! isset($storeSummary['entities'][$entityId])) {
+                if (!isset($storeSummary['entities'][$entityId]))
                     continue;
-                }
 
                 $entityData = $storeSummary['entities'][$entityId];
                 $ratingCounts = $entityData['rating_counts'] ?? [];
@@ -465,9 +394,8 @@ class CameraReportController extends Controller
                     $entityData = $storeSummary['entities'][$entityId] ?? null;
 
                     $notes = $entityData['notes'] ?? [];
-                    if (! is_array($notes)) {
+                    if (!is_array($notes))
                         $notes = [];
-                    }
 
                     $notes = collect($notes)
                         ->filter(fn($n) => is_string($n) && trim($n) !== '')
@@ -550,9 +478,8 @@ class CameraReportController extends Controller
         // entity widths (count visible entity cols)
         $col = 2;
         $totalEntityCols = 0;
-        foreach ($categoryGroups as $g) {
+        foreach ($categoryGroups as $g)
             $totalEntityCols += count($g['entities']);
-        }
 
         for ($i = 0; $i < $totalEntityCols; $i++) {
             $sheet->getColumnDimension(Coordinate::stringFromColumnIndex($col))->setWidth(18);
@@ -575,19 +502,19 @@ class CameraReportController extends Controller
 
     private function getReportData(Request $request, $user): array
     {
-
         $storeId = $request->input('store_id');
         $group = $request->input('group');
         $reportType = $request->input('report_type');
         $dateFrom = $request->input('date_from');
         $dateTo = $request->input('date_to');
         $ratingId = $request->input('rating_id');
+        $categoryIds = $request->input('category_ids');
+        $ratingId = ($ratingId !== null && $ratingId !== '') ? (int) $ratingId : null;
+        $dateRangeType = $request->input('date_range_type'); // 'weekly', 'daily', or null
         $customReportId = $request->input('custom_report_id');
 
-        $ratingId = ($ratingId !== null && $ratingId !== '') ? (int) $ratingId : null;
-
-        $userGroups = $user->isAdmin() ? null : $user->getGroupNumbers();
-
+        $allowedStoreIds = $user->allowedStoreIdsCached();
+        $categoryIds = is_array($categoryIds) ? array_filter($categoryIds) : [];
         /**
          * 1) Base query for ratings/scoring rows (NO notes join to avoid duplication)
          */
@@ -607,19 +534,20 @@ class CameraReportController extends Controller
                 'camera_forms.rating_id',
                 'ratings.label as rating_label'
             )
-            ->when(! $user->isAdmin(), fn($q) => $q->whereIn('stores.group', $userGroups))
+            ->whereIn('stores.id', $allowedStoreIds)
             ->when($storeId, fn($q) => $q->where('stores.id', $storeId))
             ->when($group, fn($q) => $q->where('stores.group', $group))
-            ->when($reportType, fn($q) => $q->where('entities.report_type', $reportType));
+            ->when($reportType, fn($q) => $q->where('entities.report_type', $reportType))
+            ->when(!empty($categoryIds), function ($q) use ($categoryIds) {
+                $q->whereIn('entities.category_id', $categoryIds);
+            });
 
-        if ($dateFrom) {
+        if ($dateFrom)
             $cameraFormsBase->where('audits.date', '>=', $dateFrom);
-        }
-        if ($dateTo) {
+        if ($dateTo)
             $cameraFormsBase->where('audits.date', '<=', $dateTo);
-        }
-        // update here
-        // ========================
+
+        $this->applyDateRangeTypeFilter($cameraFormsBase, $dateRangeType);
         if ($customReportId) {
             $selectedEntityIds = DB::table('custom_report_entities')
                 ->where('custom_report_id', $customReportId)
@@ -633,7 +561,6 @@ class CameraReportController extends Controller
             }
             // ========================
         }
-
         /**
          * Rating filter behavior:
          * - Only include STORES that have at least one row with rating_id = X
@@ -657,39 +584,33 @@ class CameraReportController extends Controller
          * 2) Entities list (for frontend)
          */
         $entitiesQuery = Entity::with('category');
-
-        // update here
-        // ======================
         if ($customReportId) {
-            $customReport = CustomReport::findOrFail($customReportId);
             $entitiesQuery->whereHas('customReports', function ($q) use ($customReportId) {
                 $q->where('custom_report_id', $customReportId);
             });
         }
-        // ======================
-
+        if (!empty($categoryIds)) {
+            $entitiesQuery->whereIn('category_id', $categoryIds);
+        }
         if ($reportType) {
             $entitiesQuery->where('report_type', $reportType);
         }
+        if (in_array($dateRangeType, ['daily', 'weekly'], true)) {
+            $entitiesQuery->where('date_range_type', $dateRangeType);
+        }
         $entities = $entitiesQuery
-            ->orderBy('category_id')
-            ->orderBy('entity_label')
+            ->orderBy('sort_order')
             ->get();
 
         /**
          * 3) Filtered stores
          */
-        $storesQuery = Store::query();
+        $storesQuery = Store::query()->whereIn('id', $allowedStoreIds);
 
-        if (! $user->isAdmin()) {
-            $storesQuery->whereIn('group', $userGroups);
-        }
-        if ($storeId) {
+        if ($storeId)
             $storesQuery->where('id', $storeId);
-        }
-        if ($group) {
+        if ($group)
             $storesQuery->where('group', $group);
-        }
 
         if ($ratingId !== null) {
             $storesQuery->whereIn('id', $eligibleStoreIds ?: [-1]);
@@ -711,17 +632,18 @@ class CameraReportController extends Controller
                 'entities.id as entity_id',
                 'camera_form_notes.note as note'
             )
-            ->when(! $user->isAdmin(), fn($q) => $q->whereIn('stores.group', $userGroups))
+            ->whereIn('stores.id', $allowedStoreIds)
             ->when($storeId, fn($q) => $q->where('stores.id', $storeId))
             ->when($group, fn($q) => $q->where('stores.group', $group))
-            ->when($reportType, fn($q) => $q->where('entities.report_type', $reportType));
+            ->when($reportType, fn($q) => $q->where('entities.report_type', $reportType))
+            ->when(!empty($categoryIds), fn($q) => $q->whereIn('entities.category_id', $categoryIds));
 
-        if ($dateFrom) {
+        $this->applyDateRangeTypeFilter($notesBase, $dateRangeType);
+
+        if ($dateFrom)
             $notesBase->where('audits.date', '>=', $dateFrom);
-        }
-        if ($dateTo) {
+        if ($dateTo)
             $notesBase->where('audits.date', '<=', $dateTo);
-        }
 
         if ($ratingId !== null) {
             $notesBase->whereIn('stores.id', $eligibleStoreIds ?: [-1]);
@@ -791,12 +713,10 @@ class CameraReportController extends Controller
 
                     foreach ($formsForDate as $form) {
                         $label = strtolower($form->rating_label ?? '');
-                        if ($label === 'pass') {
+                        if ($label === 'pass')
                             $pass++;
-                        }
-                        if ($label === 'fail') {
+                        if ($label === 'fail')
                             $fail++;
-                        }
                     }
 
                     $denom = $pass + $fail;
@@ -859,11 +779,11 @@ class CameraReportController extends Controller
         $dateTo = $request->input('date_to');
         $ratingId = $request->input('rating_id');
         $ratingId = ($ratingId !== null && $ratingId !== '') ? (int) $ratingId : null;
-        // update here
+        $categoryIds = $request->input('category_ids');
+        $categoryIds = is_array($categoryIds) ? array_filter($categoryIds) : [];
+        $allowedStoreIds = $user->allowedStoreIdsCached();
         $customReportId = $request->input('custom_report_id');
-
-        $userGroups = $user->isAdmin() ? null : $user->getGroupNumbers();
-
+        $dateRangeType = $request->input('date_range_type');
         $q = DB::table('camera_form_note_attachments as a')
             ->join('camera_form_notes as n', 'n.id', '=', 'a.camera_form_note_id')
             ->join('camera_forms as cf', 'cf.id', '=', 'n.camera_form_id')
@@ -878,17 +798,18 @@ class CameraReportController extends Controller
                 'audits.date as date',
                 'a.path as path'
             )
-            ->when(! $user->isAdmin(), fn($qq) => $qq->whereIn('stores.group', $userGroups))
+            ->whereIn('stores.id', $allowedStoreIds)
             ->when($storeId, fn($qq) => $qq->where('stores.id', $storeId))
             ->when($group, fn($qq) => $qq->where('stores.group', $group))
-            ->when($reportType, fn($qq) => $qq->where('entities.report_type', $reportType));
+            ->when($reportType, fn($qq) => $qq->where('entities.report_type', $reportType))
+            ->when(!empty($categoryIds), fn($qq) => $qq->whereIn('entities.category_id', $categoryIds));
 
-        if ($dateFrom) {
+        $this->applyDateRangeTypeFilter($q, $dateRangeType);
+
+        if ($dateFrom)
             $q->where('audits.date', '>=', $dateFrom);
-        }
-        if ($dateTo) {
+        if ($dateTo)
             $q->where('audits.date', '<=', $dateTo);
-        }
 
         if ($ratingId !== null) {
             $eligibleStoreIds = (clone $q)
@@ -900,21 +821,27 @@ class CameraReportController extends Controller
 
             $q->whereIn('stores.id', $eligibleStoreIds ?: [-1]);
         }
-
-        // update here
         if ($customReportId) {
             $selectedEntityIds = DB::table('custom_report_entities')
                 ->where('custom_report_id', $customReportId)
                 ->pluck('entity_id')
                 ->toArray();
 
-            if (! empty($selectedEntityIds)) {
+            if (!empty($selectedEntityIds)) {
                 $q->whereIn('entities.id', $selectedEntityIds);
             } else {
                 $q->whereRaw('1 = 0');
             }
         }
-
         return $q->get();
+    }
+
+    private function applyDateRangeTypeFilter($query, $dateRangeType)
+    {
+        if (in_array($dateRangeType, ['daily', 'weekly'], true)) {
+            $query->where('entities.date_range_type', $dateRangeType);
+        }
+
+        return $query;
     }
 }

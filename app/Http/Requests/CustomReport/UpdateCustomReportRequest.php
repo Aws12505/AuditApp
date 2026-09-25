@@ -8,6 +8,9 @@ use Illuminate\Http\Exceptions\HttpResponseException;
 
 class UpdateCustomReportRequest extends FormRequest
 {
+    /**
+     * Determine if the user is authorized to make this request.
+     */
     public function authorize(): bool
     {
         return true;
@@ -39,7 +42,7 @@ class UpdateCustomReportRequest extends FormRequest
             'entity_ids.*.exists' => 'Each selected entity must be a valid entity.',
         ];
     }
-    /*
+
     protected function failedValidation(Validator $validator)
     {
         throw new HttpResponseException(
@@ -50,5 +53,4 @@ class UpdateCustomReportRequest extends FormRequest
             ], 422)
         );
     }
-        */
 }
